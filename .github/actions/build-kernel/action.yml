@@ -1220,7 +1220,7 @@ runs:
         
         echo "::endgroup::"
 
-    - name: Apply ZeroMount Patch
+- name: Apply ZeroMount Patch
       shell: bash
       if: ${{ inputs.enable_zeromount == 'true' || inputs.enable_zeromount == true }}
       run: |
@@ -1231,9 +1231,10 @@ runs:
         
         git clone --depth 1 https://github.com/Enginex0/Super-Builders.git /tmp/super-builders
         
-        Z_C=$(find /tmp/super-builders -type f -name "zeromount.c" | head -n 1)
-        Z_H=$(find /tmp/super-builders -type f -name "zeromount.h" | head -n 1)
-        Z_PATCH=$(find /tmp/super-builders -type f \( -name "vfs_getname*.patch" -o -name "*zeromount*.patch" \) | head -n 1)
+        # Use -quit to avoid broken pipe errors under strict pipefail
+        Z_C=$(find /tmp/super-builders -type f -name "zeromount.c" -print -quit)
+        Z_H=$(find /tmp/super-builders -type f -name "zeromount.h" -print -quit)
+        Z_PATCH=$(find /tmp/super-builders -type f \( -name "vfs_getname*.patch" -o -name "*zeromount*.patch" \) -print -quit)
         
         if [ -n "$Z_C" ] && [ -n "$Z_H" ]; then
             echo "Found ZeroMount source files at $Z_C and $Z_H"
