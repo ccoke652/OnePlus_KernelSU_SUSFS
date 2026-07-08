@@ -1227,14 +1227,32 @@ runs:
         set -euo pipefail
         echo "::group::Apply ZeroMount patch"
         cd "$COMMON_KERNEL_FOLDER"
-        echo "🗂️ ZeroMount is enabled! Cloning and applying patches..."
+        echo "🗂️ ZeroMount is enabled! Cloning Enginex0/Super-Builders to extract patches..."
         
-        git clone https://github.com/Enginex0/zeromount.git ../zeromount
+        git clone --depth 1 https://github.com/Enginex0/Super-Builders.git /tmp/super-builders
         
-        cp ../zeromount/zeromount.c fs/
-        cp ../zeromount/zeromount.h fs/
+        Z_C=$(find /tmp/super-builders -type f -name "zeromount.c" | head -n 1)
+        Z_H=$(find /tmp/super-builders -type f -name "zeromount.h" | head -n 1)
+        Z_PATCH=$(find /tmp/super-builders -type f \( -name "vfs_getname*.patch" -o -name "*zeromount*.patch" \) | head -n 1)
         
-        patch -p1 < ../zeromount/vfs_getname.patch || echo "::warning::ZeroMount patch failed or file missing. Verify patch name."
+        if [ -n "$Z_C" ] && [ -n "$Z_H" ]; then
+            echo "Found ZeroMount source files at $Z_C and $Z_H"
+            cp "$Z_C" fs/
+            cp "$Z_H" fs/
+            if ! grep -q "obj-y += zeromount.o" fs/Makefile; then
+                echo "obj-y += zeromount.o" >> fs/Makefile
+            fi
+        else
+            echo "::error::Could not find zeromount.c or zeromount.h in Enginex0/Super-Builders"
+            exit 1
+        fi
+        
+        if [ -n "$Z_PATCH" ]; then
+            echo "Found ZeroMount patch at $Z_PATCH"
+            patch -p1 < "$Z_PATCH" || echo "::warning::ZeroMount patch failed. Verify patch compatibility."
+        else
+            echo "::warning::Could not find VFS patch in Enginex0/Super-Builders"
+        fi
         
         echo "✅ ZeroMount patched successfully!"
         echo "::endgroup::"
@@ -1947,4 +1965,322 @@ runs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
         ccache -s >> $GITHUB_STEP_SUMMARY
-        echo '
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+    - name: Collect Build Stats / Validate Image
+      id: collect_stats
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Collect Build stats"
+        IMG="$COMMON_KERNEL_FOLDER/out/arch/arm64/boot/Image"
+        
+        if [ -f "$KERNEL_PLATFORM_FOLDER/out/$OP_ANDROID_VERSION-$OP_KERNEL_VERSION/dist/Image" ]; then
+          IMG="$KERNEL_PLATFORM_FOLDER/out/$OP_ANDROID_VERSION-$OP_KERNEL_VERSION/dist/Image"
+        elif [ -f "$KERNEL_PLATFORM_FOLDER/bazel-bin/common/kernel_aarch64/Image" ]; then
+          IMG="$KERNEL_PLATFORM_FOLDER/bazel-bin/common/kernel_aarch64/Image"
+        fi
+        
+        if [ -f "$COMMON_KERNEL_FOLDER/build.log" ]; then
+          WARNINGS_COUNT="$(grep -ciE '\bwarning:' "$COMMON_KERNEL_FOLDER/build.log" || true)"
+          [ -n "$WARNINGS_COUNT" ] || WARNINGS_COUNT="0"
+        else
+          WARNINGS_COUNT="0"
+        fi
+        
+        if [ ! -f "$IMG" ]; then
+          echo "::error::Kernel Image not found at: $IMG"
+          exit 1
+        fi
+        
+        if ! file "$IMG" | grep -qi 'ARM64'; then
+          echo "::error::Image is not ARM64 format"
+          file "$IMG"
+          exit 1
+        fi
+        
+        IMG_SIZE=$(stat -c %s "$IMG")
+        MIN_SIZE=6102400
+        if [ "$IMG_SIZE" -lt "$MIN_SIZE" ]; then
+          echo "::error::Image size too small: $(numfmt --to=iec-i --suffix=B "$IMG_SIZE")"
+          exit 1
+        fi
+        
+        IMG_SHA256=$(sha256sum "$IMG" | awk '{print $1}')
+        BUILD_TIME="${BUILD_TIME:-0}"
+        
+        KERNEL_UNAME=$(strings "$IMG" | grep -E 'Linux version.*#' | tail -n1)
+        echo "Kernel Uname: $KERNEL_UNAME"
+        echo "KERNEL_UNAME=$KERNEL_UNAME" >> "$GITHUB_ENV"
+        
+        printf 'warnings_count=%s\n' "$WARNINGS_COUNT" >> "$GITHUB_OUTPUT"
+        printf 'image_sha256=%s\n' "$IMG_SHA256" >> "$GITHUB_OUTPUT"
+        printf 'build_time=%s\n' "$BUILD_TIME" >> "$GITHUB_OUTPUT"
+        
+        echo "✅ Validation passed:"
+        echo "   - Warnings: $WARNINGS_COUNT"
+        echo "   - Image size: $(numfmt --to=iec-i --suffix=B "$IMG_SIZE")"
+        echo "   - SHA256: $IMG_SHA256"
+        echo "   - Build time: ${BUILD_TIME}s"
+        echo "::endgroup::"
+
+    - name: Create Kernel ZIP
+      id: create_zip
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Create kernel ZIP package"
+        
+        IMAGE_PATH="$COMMON_KERNEL_FOLDER/out/arch/arm64/boot/Image"
+        
+        if [ -f "$KERNEL_PLATFORM_FOLDER/out/$OP_ANDROID_VERSION-$OP_KERNEL_VERSION/dist/Image" ]; then
+          IMAGE_PATH="$KERNEL_PLATFORM_FOLDER/out/$OP_ANDROID_VERSION-$OP_KERNEL_VERSION/dist/Image"
+        elif [ -f "$KERNEL_PLATFORM_FOLDER/bazel-bin/common/kernel_aarch64/Image" ]; then
+          IMAGE_PATH="$KERNEL_PLATFORM_FOLDER/bazel-bin/common/kernel_aarch64/Image"
+        fi
+        
+        if [ ! -f "$IMAGE_PATH" ]; then
+          echo "::error::Built Image not found at: $IMAGE_PATH"
+          exit 1
+        fi
+        
+        cp "$IMAGE_PATH" "$AK3_FOLDER/Image"
+        
+        mv "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt" "$AK3_FOLDER/"
+        cd "$AK3_FOLDER"
+        
+        sed -i 's/do.check_boot_version=.*/do.check_boot_version=1/' anykernel.sh
+        
+        case "$OP_BRANCH" in
+          wild/sm8850|wild/sm8845)
+            echo "Applying BBG efisp abl whitelist control patch"
+            patch -p1 < "$KERNEL_PATCHES_FOLDER/common/bbg/0001-Enable-volume-input-to-enable-bbg-efisp-patch.patch"
+          ;;
+        esac
+        
+        ZIP_MODEL=$(echo "$OP_MODEL" | sed 's/-[0-9]\+\.[0-9]\+\.[0-9]\+$//')
+        if [ "${{ env.OP_SUSFS }}" = true ]; then
+          ZIP_NAME="AK3_${ZIP_MODEL}_${OP_OS_VERSION}_${KERNEL_FULL_VER}_${{ inputs.ksu_type }}_${KSUVER:-unknown}_SuSFS_${SUSVER:-unknown}.zip"
+        else
+          ZIP_NAME="AK3_${ZIP_MODEL}_${OP_OS_VERSION}_${KERNEL_FULL_VER}_${{ inputs.ksu_type }}_${KSUVER:-unknown}.zip"
+        fi
+        mkdir -p "$ARTIFACTS_FOLDER"
+        
+        echo "Creating flashable ZIP: $ZIP_NAME"
+        
+        if ! zip -r9 "$ZIP_NAME" ./* \
+             -x "*.git*" \
+             -x "$ZIP_NAME" \
+             -x "README.md" 2>&1 | tee /tmp/zip.log; then
+          echo "::error::Failed to create ZIP package"
+          exit 1
+        fi
+        
+        mv "$ZIP_NAME" "$ARTIFACTS_FOLDER/"
+        
+        find "$ARTIFACTS_FOLDER" -maxdepth 1 -type f ! -name "$ZIP_NAME" -delete
+        
+        ZIP_SIZE=$(stat -c%s "$ARTIFACTS_FOLDER/$ZIP_NAME")
+        ZIP_SHA256=$(sha256sum "$ARTIFACTS_FOLDER/$ZIP_NAME" | awk '{print $1}')
+        printf 'zip_sha256=%s\n' "$ZIP_SHA256" >> "$GITHUB_OUTPUT"
+        
+        echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+        echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+        
+        echo ""
+        echo "✅ Kernel ZIP created successfully"
+        echo "   Name: $ZIP_NAME"
+        echo "   Size: $(numfmt --to=iec-i --suffix=B "$ZIP_SIZE")"
+        echo "   SHA256: $ZIP_SHA256"
+        echo "::endgroup::"
+
+    - name: Final Build Summary
+      shell: bash
+      run: |
+        set -euo pipefail
+        
+        KSU_SHA="${KSU_COMMIT_SHA:-unknown}"
+        SUSFS_SHA="${SUSFS_COMMIT_SHA:-unknown}"
+        
+        {
+          echo "Model: ${{ env.OP_MODEL }}"
+          echo "OS Version: ${{ env.OP_OS_VERSION }}"
+          echo "Android: ${{ env.ANDROID_VER }}"
+          echo "Kernel base: ${{ env.KERNEL_VER }}"
+          echo "Kernel full: ${{ env.KERNEL_FULL_VER }}"
+          echo "Kernel Uname: ${{ env.KERNEL_UNAME }}"
+          echo "Build User: ${{ env.BUILD_USER }}"
+          echo "Build Host: ${{ env.BUILD_HOST }}"
+          if [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
+            echo "KSUN Version: ${KSUVER:-unknown}"
+            echo "KSUN commit SHA: ${KSU_SHA:-unknown}"
+          else
+            echo "KSU Version: ${KSUVER:-unknown}"
+            echo "KSU commit SHA: ${KSU_SHA:-unknown}"
+          fi
+          if [ "${{ env.OP_SUSFS }}" = true ]; then
+            echo "SUSFS Version: ${SUSVER:-unknown}"
+            echo "SUSFS commit SHA: $SUSFS_SHA"
+          fi
+          echo "Optimization: ${{ inputs.optimize_level }}"
+          echo "Clean Build: ${{ inputs.clean }}"
+          echo ""
+          echo "=== OnePlus Features ==="
+          echo "Kernel Optimisations: ${{ env.OP_OPT }}"
+          echo "BBR: ${{ env.OP_BBR }}"
+          echo "BBRv3: ${{ env.OP_BBR3 }}"
+          echo "BBG: ${{ env.OP_BBG }}"
+          echo "HMBIRD SCX: ${{ env.OP_HMBIRD }}"
+          echo "TTL: ${{ env.OP_TTL }}"
+          echo "IP_SET & IPv6 NAT: ${{ env.OP_IP_SET }}"
+          echo "Unicode Fix: ${{ env.OP_UNICODE }}"
+          echo "NTSync: ${{ env.OP_NTSYNC }}"
+          echo "Droidspaces: ${{ env.OP_DS }}"
+          echo ""
+          echo "Image SHA256: ${{ steps.collect_stats.outputs.image_sha256 }}"
+          echo "AnyKernel3 ZIP SHA256: ${{ steps.create_zip.outputs.zip_sha256 }}"
+          echo "Compiler: ${CLANG_VERSION:-unknown}"
+          echo "Warnings Count: ${{ steps.collect_stats.outputs.warnings_count }}"
+          echo "Build Time: ${{ steps.collect_stats.outputs.build_time }}s"
+          if [ "${{ inputs.clean }}" == "false" ]; then
+            echo "ccache Hit Rate: ${{ steps.ccache_stats.outputs.hit_rate }}"
+            echo "ccache Direct Rate: ${{ steps.ccache_stats.outputs.direct_rate }}"
+          else
+            echo "ccache: Disabled (clean build)"
+          fi
+          echo "Artifact Name: ${{ env.ZIP_NAME }}"
+        } | tee summary.txt
+        
+        {
+          echo "### 🎯 Kernel Build Summary"
+          echo ""
+          echo "| Metric | Value |"
+          echo "|--------|-------|"
+          echo "| **Model** | ${{ env.OP_MODEL }} |"
+          echo "| **OS Version** | ${{ env.OP_OS_VERSION }} |"
+          echo "| **Kernel Version** | ${{ steps.save_metadata.outputs.kernel_version }} |"
+          echo "| **Kernel Uname** | \`${{ env.KERNEL_UNAME }}\` |"
+          echo "| **Build User** | ${{ env.BUILD_USER }} |"
+          echo "| **Build Host** | ${{ env.BUILD_HOST }} |"
+          if [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
+            echo "| **KSUN Version** | ${KSUVER:-unknown} |"
+          else
+            echo "| **KSU Version** | ${KSUVER:-unknown} |"
+          fi
+          
+          if [ "$KSU_SHA" != "unknown" ]; then
+            if [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
+              echo "| **KSUN Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/KernelSU-Next/KernelSU-Next/commit/$KSU_SHA) |"
+            else
+              echo "| **KSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/tiann/KernelSU/commit/$KSU_SHA) |"
+            fi
+          else
+            echo "| **KSU Commit** | unknown |"
+          fi
+          
+          if [ "${{ env.OP_SUSFS }}" = true ]; then
+            echo "| **SUSFS Version** | ${SUSVER:-unknown} |"
+            
+            if [ "$SUSFS_SHA" != "unknown" ]; then
+              echo "| **SUSFS Commit** | [\`${SUSFS_SHA:0:8}\`](https://gitlab.com/simonpunk/susfs4ksu/-/commit/$SUSFS_SHA) |"
+            else
+              echo "| **SUSFS Commit** | unknown |"
+            fi
+          fi
+          
+          echo ""
+          echo "### 🔧 OnePlus Features"
+          echo ""
+          echo "| Feature | Status |"
+          echo "|---------|--------|"
+          echo "| **Kernel Optimisations** | ${{ env.OP_OPT }} |"
+          echo "| **BBR** | ${{ env.OP_BBR }} |"
+          echo "| **BBRv3** | ${{ env.OP_BBR3 }} |"
+          echo "| **BBG** | ${{ env.OP_BBG }} |"
+          echo "| **HMBIRD SCX** | ${{ env.OP_HMBIRD }} |"
+          echo "| **TTL** | ${{ env.OP_TTL }} |"
+          echo "| **IP_SET & IPv6 NAT** | ${{ env.OP_IP_SET }} |"
+          echo "| **Unicode Fix** | ${{ env.OP_UNICODE }} |"
+          echo "| **NTSync** | ${{ env.OP_NTSYNC }} |"
+          echo "| **Droidspaces** | ${{ env.OP_DS }} |"
+          
+          echo ""
+          echo "### 📊 Build Metrics"
+          echo ""
+          echo "| Metric | Value |"
+          echo "|--------|-------|"
+          echo "| **Optimization** | ${{ inputs.optimize_level }} |"
+          echo "| **Clean Build** | ${{ inputs.clean }} |"
+          echo "| **Build Time** | ${{ steps.collect_stats.outputs.build_time }}s |"
+          
+          if [ "${{ inputs.clean }}" == "false" ]; then
+            echo "| **ccache Hit Rate** | ${{ steps.ccache_stats.outputs.hit_rate }} |"
+            echo "| **ccache Direct Rate** | ${{ steps.ccache_stats.outputs.direct_rate }} |"
+          fi
+          
+          echo "| **Image SHA256** | \`${{ steps.collect_stats.outputs.image_sha256 }}\` |"
+          echo "| **Warnings** | ${{ steps.collect_stats.outputs.warnings_count }} |"
+          echo "| **Compiler** | \`${CLANG_VERSION:-unknown}\` |"
+          echo "| **Artifact Name** | \`${{ env.ZIP_NAME }}\` |"
+          echo "| **AnyKernel3 SHA256** | \`${{ steps.create_zip.outputs.zip_sha256 }}\` |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload Debug Artifacts
+      if: ${{ always() && !cancelled() && inputs.debug == 'true' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.DEBUG_ZIP_NAME }}
+        path: ${{ env.DEBUG_ARTIFACTS_FOLDER }}
+        compression-level: 9
+        retention-days: 90
+
+    - name: Upload Artifacts
+      if: success() && steps.create_zip.conclusion == 'success'
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.ZIP_NAME }}
+        path: ${{ env.ARTIFACTS_FOLDER }}/${{ env.ZIP_NAME }}
+        archive: false
+        compression-level: 0
+        retention-days: 90
+
+    - name: Upload ccache log
+      if: success() && inputs.debug == 'true' && steps.build_kernel_step.conclusion == 'success'
+      uses: actions/upload-artifact@v7
+      with:
+        name: "${{ env.OP_MODEL }}_${{ env.OP_OS_VERSION }}_${{ env.KERNEL_FULL_VER }}_ccache.log"
+        path: ${{ env.CCACHE_LOGFILE }}
+        archive: false
+        compression-level: 0
+        retention-days: 90
+
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v6
+      if: always() && steps.build_kernel_step.conclusion == 'success'
+      with:
+        path: main-source
+        fetch-depth: 1
+
+    - name: Save ccache cache
+      if: always() && steps.build_kernel_step.conclusion == 'success'
+      uses: ./action-source/.github/actions/cache/save
+      with:
+        cache_path: ${{ env.CCACHE_DIR }}
+        cache_key: ${{ inputs.ksu_type }}-v3-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
+        cache_bucket: "ccache-cache"
+        debug: ${{ inputs.debug }}
+        github_token: ${{ inputs.github_token }}
+        working_dir: "./main-source"
+        compression_level: 6
+
+    - name: Save LTO LD cache
+      if: always() && ${{ env.OP_LTO != 'none' }} && steps.build_kernel_step.conclusion == 'success'
+      uses: ./action-source/.github/actions/cache/save
+      with:
+        cache_path: ${{ env.LDCACHE_DIR }}
+        cache_key: ${{ inputs.ksu_type }}-v3-LTO-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
+        cache_bucket: "lto-cache"
+        debug: ${{ inputs.debug }}
+        github_token: ${{ inputs.github_token }}
+        working_dir: "./main-source"
+        compression_level: 6
