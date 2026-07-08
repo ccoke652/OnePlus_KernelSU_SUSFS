@@ -1220,7 +1220,7 @@ runs:
         
         echo "::endgroup::"
 
-- name: Apply ZeroMount Patch
+    - name: Apply ZeroMount Patch
       shell: bash
       if: ${{ inputs.enable_zeromount == 'true' || inputs.enable_zeromount == true }}
       run: |
