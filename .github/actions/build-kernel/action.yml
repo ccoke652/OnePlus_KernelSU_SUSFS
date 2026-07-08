@@ -1227,16 +1227,16 @@ runs:
         set -euo pipefail
         echo "::group::Apply ZeroMount patch"
         cd "$COMMON_KERNEL_FOLDER"
-        echo "🗂️ ZeroMount is enabled! Cloning Enginex0/Super-Builders to extract patches..."
+        echo "🗂️ ZeroMount is enabled! Cloning Enginex0/zeromount to extract driver..."
         
-        git clone --depth 1 https://github.com/Enginex0/Super-Builders.git /tmp/super-builders
+        # Clone the actual driver repository
+        git clone --depth 1 https://github.com/Enginex0/zeromount.git /tmp/zeromount-driver
         
-        # Use -quit to avoid broken pipe errors under strict pipefail
-        Z_C=$(find /tmp/super-builders -type f -name "zeromount.c" -print -quit)
-        Z_H=$(find /tmp/super-builders -type f -name "zeromount.h" -print -quit)
-        Z_PATCH=$(find /tmp/super-builders -type f \( -name "vfs_getname*.patch" -o -name "*zeromount*.patch" \) -print -quit)
+        # The driver files are usually in the 'kernel' folder of that repo
+        Z_C="/tmp/zeromount-driver/kernel/zeromount.c"
+        Z_H="/tmp/zeromount-driver/kernel/zeromount.h"
         
-        if [ -n "$Z_C" ] && [ -n "$Z_H" ]; then
+        if [ -f "$Z_C" ] && [ -f "$Z_H" ]; then
             echo "Found ZeroMount source files at $Z_C and $Z_H"
             cp "$Z_C" fs/
             cp "$Z_H" fs/
@@ -1244,15 +1244,8 @@ runs:
                 echo "obj-y += zeromount.o" >> fs/Makefile
             fi
         else
-            echo "::error::Could not find zeromount.c or zeromount.h in Enginex0/Super-Builders"
+            echo "::error::Could not find zeromount.c or zeromount.h in Enginex0/zeromount/kernel/"
             exit 1
-        fi
-        
-        if [ -n "$Z_PATCH" ]; then
-            echo "Found ZeroMount patch at $Z_PATCH"
-            patch -p1 < "$Z_PATCH" || echo "::warning::ZeroMount patch failed. Verify patch compatibility."
-        else
-            echo "::warning::Could not find VFS patch in Enginex0/Super-Builders"
         fi
         
         echo "✅ ZeroMount patched successfully!"
